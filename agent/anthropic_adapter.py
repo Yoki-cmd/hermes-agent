@@ -768,6 +768,7 @@ def build_anthropic_client(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    proxy: str = None,
 ):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -813,6 +814,18 @@ def build_anthropic_client(
 
     normalize_proxy_env_vars()
 
+    # Local patch (Yoki-cmd/hermes-agent, not upstream): per-provider proxy.
+    # When no explicit proxy is given, look up custom_providers[].proxy in
+    # config.yaml by base_url; a match routes only this provider's traffic
+    # through the proxy via an explicit http_client.
+    if proxy is None and base_url:
+        try:
+            from hermes_cli.config import get_custom_provider_proxy_settings
+
+            proxy = get_custom_provider_proxy_settings(base_url)
+        except Exception:
+            proxy = None
+
     from httpx import Timeout
 
     normalized_base_url = _normalize_base_url_text(base_url)
@@ -829,6 +842,14 @@ def build_anthropic_client(
         # refill for minutes. (#26293)
         "max_retries": 0,
     }
+    if proxy:
+        # The SDK has no proxy kwarg; an explicit http_client owns the proxy.
+        import httpx as _httpx
+
+        kwargs["http_client"] = _httpx.Client(
+            proxy=proxy,
+            timeout=_httpx.Timeout(timeout=float(_read_timeout), connect=10.0),
+        )
     if normalized_base_url:
         # Azure Anthropic endpoints require an ``api-version`` query parameter.
         # Pass it via default_query so the SDK appends it to every request URL

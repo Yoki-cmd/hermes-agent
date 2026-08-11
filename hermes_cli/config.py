@@ -1315,7 +1315,7 @@ def _normalize_custom_provider_entry(
         "provider",
         "name", "api", "url", "base_url", "api_key", "key_env", "api_key_env",
         "api_mode", "transport", "model", "default_model", "models",
-        "context_length", "rate_limit_delay",
+        "context_length", "proxy", "rate_limit_delay",
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
@@ -1463,6 +1463,10 @@ def _normalize_custom_provider_entry(
     elif isinstance(ssl_verify, str) and ssl_verify.strip():
         normalized["ssl_verify"] = ssl_verify.strip()
 
+    proxy = entry.get("proxy")
+    if isinstance(proxy, str) and proxy.strip():
+        normalized["proxy"] = proxy.strip()
+
     return normalized
 
 
@@ -1493,6 +1497,7 @@ def _custom_provider_entry_to_provider_config(
         "extra_headers",
         "ssl_ca_cert",
         "ssl_verify",
+        "proxy",
     ):
         if field in normalized:
             provider_entry[field] = normalized[field]
@@ -1629,6 +1634,41 @@ def apply_custom_provider_tls_to_client_kwargs(
         client_kwargs["ssl_ca_cert"] = tls["ssl_ca_cert"]
     if "ssl_verify" in tls:
         client_kwargs["ssl_verify"] = tls["ssl_verify"]
+
+
+def get_custom_provider_proxy_settings(
+    base_url: str,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Return the per-provider ``proxy`` URL from a matching custom-provider entry.
+
+    Matches by normalized base_url (same rule as the TLS/extra_headers
+    helpers). Returns ``None`` when no entry or no ``proxy`` field matches.
+    Local patch (Yoki-cmd/hermes-agent, not upstream): lets a custom provider
+    route through a specific proxy (e.g. Clash) without affecting any other
+    provider's traffic.
+    """
+    if custom_providers is None:
+        try:
+            custom_providers = get_compatible_custom_providers(config)
+        except Exception:
+            custom_providers = []
+    if not base_url or not isinstance(custom_providers, list):
+        return None
+
+    target_url = normalize_route_base_url(base_url)
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = normalize_route_base_url(entry.get("base_url"))
+        if not entry_url or entry_url != target_url:
+            continue
+        proxy = entry.get("proxy")
+        if isinstance(proxy, str) and proxy.strip():
+            return proxy.strip()
+        return None
+    return None
 
 
 def normalize_extra_headers(extra_headers: Any) -> Dict[str, str]:

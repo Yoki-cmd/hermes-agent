@@ -124,7 +124,23 @@ def _get_proxy_from_env() -> Optional[str]:
 
 
 def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
-    """Return an env-configured proxy unless NO_PROXY excludes this base URL."""
+    """Return an env-configured proxy unless NO_PROXY excludes this base URL.
+
+    Local patch (Yoki-cmd/hermes-agent, not upstream): a matching
+    ``custom_providers[].proxy`` entry in config.yaml wins first, so a
+    provider behind a proxy (e.g. agentrouter via Clash) routes only its
+    own traffic through it while every other provider keeps the env policy.
+    """
+    if base_url:
+        try:
+            from hermes_cli.config import get_custom_provider_proxy_settings
+
+            cp_proxy = get_custom_provider_proxy_settings(base_url)
+            if cp_proxy:
+                return cp_proxy
+        except Exception:
+            pass
+
     proxy = _get_proxy_from_env()
     if not proxy or not base_url:
         return proxy
