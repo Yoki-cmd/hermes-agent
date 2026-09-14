@@ -13,6 +13,9 @@ These tests pin the wire-shape contract:
                           including ``max``/``xhigh``
   - enabled + no effort → nothing emitted (endpoint's server default applies)
   - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
+  - loopback Ollama (127.0.0.1/localhost/::1 + :11434) ONLY: Hermes-only
+    levels are clamped onto Ollama's accepted set — Ollama /v1 400s on
+    ``minimal``/``xhigh``/``ultra`` (local fork patch, 2026-09)
 """
 
 from __future__ import annotations
@@ -106,4 +109,79 @@ class TestCustomReasoningWithNumCtx:
         )
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
+
+
+class TestLocalOllamaEffortClamp:
+    """Loopback Ollama endpoints receive an Ollama-legal reasoning_effort.
+
+    Ollama's /v1/chat/completions rejects Hermes-only levels with
+    ``HTTP 400 invalid reasoning value`` (legal set: none/low/medium/high/
+    max). The clamp is port-scoped to the Ollama default + loopback hosts
+    so other custom endpoints keep their exact value.
+    """
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://127.0.0.1:11434/v1",
+            "http://localhost:11434",
+            "http://[::1]:11434/v1",
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("effort", "expected"),
+        [
+            ("ultra", "max"),
+            ("xhigh", "max"),
+            ("minimal", "low"),
+            ("max", "max"),
+            ("high", "high"),
+            ("medium", "medium"),
+            ("low", "low"),
+        ],
+    )
+    def test_effort_clamped_for_loopback_ollama(
+        self, custom_profile, base_url, effort, expected
+    ):
+        _, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort},
+            model="minicpm5",
+            base_url=base_url,
+        )
+        assert tl == {"reasoning_effort": expected}
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://localhost:10993/v1",  # local sidecar on another port
+            "http://127.0.0.1:8080/v1",  # llama-server
+            "https://agentrouter.org/v1",  # remote gateway
+            None,  # no base_url → nothing to scope on
+        ],
+    )
+    def test_effort_untouched_outside_loopback_ollama(self, custom_profile, base_url):
+        _, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            model="glm-5.2",
+            base_url=base_url,
+        )
+        assert tl == {"reasoning_effort": "ultra"}
+
+    def test_unknown_level_falls_back_to_legal(self, custom_profile):
+        """A future/foreign level must not 400 the request → mid-high legal."""
+        _, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "quantum"},
+            model="minicpm5",
+            base_url="http://127.0.0.1:11434/v1",
+        )
+        assert tl == {"reasoning_effort": "high"}
+
+    def test_disabled_stays_none_on_loopback_ollama(self, custom_profile):
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="minicpm5",
+            base_url="http://127.0.0.1:11434/v1",
+        )
+        assert eb == {"think": False}
+        assert tl == {"reasoning_effort": "none"}
 
