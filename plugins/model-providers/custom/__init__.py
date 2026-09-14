@@ -9,13 +9,64 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
     + extra_body.think = False for /api/chat and proxies
   - reasoning_config enabled + effort → top-level reasoning_effort
     (the native OpenAI-compatible format GLM/ARK expect; unset omits it
-    so the endpoint's server default applies)
+    so the endpoint's server default applies). For loopback Ollama
+    endpoints the effort is first clamped onto {none,low,medium,high,max} —
+    Ollama 400s on Hermes-only levels such as ultra/minimal/xhigh.
 """
 
 from typing import Any
+from urllib.parse import urlsplit
 
 from providers import register_provider
 from providers.base import ProviderProfile
+
+
+# Ollama's OpenAI-compatible endpoint accepts exactly these reasoning_effort
+# values and HTTP-400s on anything else (verified against Ollama 0.32.x):
+#   "invalid reasoning value: 'ultra' (must be "high", "medium", "low",
+#    "max", or "none")"
+# Hermes' wider ladder (minimal/low/medium/high/xhigh/max/ultra) must be
+# clamped before it reaches a local Ollama server — otherwise a session-level
+# effort such as the global "ultra" 400s every request to the local model.
+# (Local fork patch, 2026-09 — deliberately not upstreamed.)
+_OLLAMA_LEGAL_EFFORTS = frozenset({"none", "low", "medium", "high", "max"})
+_OLLAMA_EFFORT_CLAMP = {
+    "minimal": "low",   # nearest legal level
+    "xhigh": "max",     # both sit above "high"
+    "ultra": "max",     # preserve the "deepest thinking" intent
+}
+
+
+def _is_local_ollama_base_url(base_url: str | None) -> bool:
+    """True for loopback Ollama endpoints (127.0.0.1/localhost/::1 + :11434).
+
+    Port-scoped to the Ollama default so other loopback custom endpoints
+    (e.g. a local OpenAI-compatible sidecar on another port) keep receiving
+    their exact effort string.
+    """
+    if not base_url:
+        return False
+    try:
+        parts = urlsplit(str(base_url))
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return False
+    if host == "localhost" or host == "::1" or host.startswith("127."):
+        return port == 11434
+    return False
+
+
+def _clamp_ollama_effort(effort: str) -> str:
+    """Map a Hermes effort level onto Ollama's accepted set."""
+    if effort in _OLLAMA_LEGAL_EFFORTS:
+        return effort
+    mapped = _OLLAMA_EFFORT_CLAMP.get(effort)
+    if mapped is not None:
+        return mapped
+    # Unknown/future level: fall back to a legal value rather than 400-ing
+    # the whole request.
+    return "high"
 
 
 class CustomProfile(ProviderProfile):
@@ -44,6 +95,8 @@ class CustomProfile(ProviderProfile):
         #   - enabled + effort set → TOP-LEVEL reasoning_effort string, the
         #     format GLM-5.2/ARK and other OpenAI-compatible reasoning APIs
         #     expect (GLM documents "high" and "max"; "max" is its default).
+        #     For LOCAL OLLAMA endpoints the value is first clamped onto the
+        #     server's accepted set — see _clamp_ollama_effort above.
         #   - enabled + no effort  → omit both, so the endpoint applies its own
         #     server-side default (do NOT force a level the user didn't pick).
         #
@@ -64,6 +117,8 @@ class CustomProfile(ProviderProfile):
                 top_level["reasoning_effort"] = "none"
                 extra_body["think"] = False
             elif _effort:
+                if _is_local_ollama_base_url(ctx.get("base_url")):
+                    _effort = _clamp_ollama_effort(_effort)
                 top_level["reasoning_effort"] = _effort
 
         return extra_body, top_level
