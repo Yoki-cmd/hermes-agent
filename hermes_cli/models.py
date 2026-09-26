@@ -13,6 +13,7 @@ import re
 import urllib.parse
 import urllib.request
 import urllib.error
+import threading
 import time
 from difflib import get_close_matches
 from pathlib import Path
@@ -3060,12 +3061,27 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     normally reads. Swap your OPENAI_API_KEY and the entry invalidates.
 #   - 1h TTL by default. `force_refresh=True` skips the cache entirely
 #     and overwrites it on success.
-#   - Only NON-EMPTY results are cached. An empty/None response from a
-#     transient network error never gets pinned.
+#   - Stale-while-revalidate: an expired entry is still served immediately
+#     and refreshed in a background daemon thread, so a slow/unreachable
+#     /models endpoint never blocks the picker (desktop model tab times out
+#     at 15s). The in-flight guard deduplicates concurrent refreshes.
+#   - Failed fetches are negative-cached for 5min to avoid re-attempting a
+#     dead network on every open. A negative entry keeps the last-known
+#     model list under ``models`` (served as stale fallback); ``negative``
+#     marks that the last live attempt failed. Only a cold miss with no
+#     prior data caches ``models: []``.
 #   - Cache file is best-effort. Any read/write error degrades silently
 #     to a live fetch — the picker keeps working.
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
+
+# After a live /models fetch fails (empty result), suppress re-fetch attempts
+# for this long so a dead network cannot turn every picker open into another
+# multi-second stall. Subsequent opens fall back to curated/static lists.
+_PROVIDER_MODELS_NEGATIVE_TTL = 300  # 5min
+
+# Slugs with a background refresh currently running (guarded by this set).
+_provider_models_refresh_inflight: set[str] = set()
 
 
 def _provider_models_cache_path() -> Path:
@@ -3179,6 +3195,42 @@ def _save_provider_models_cache(data: dict) -> None:
         pass
 
 
+def _refresh_provider_models_in_background(provider: str, fingerprint: str) -> None:
+    """Re-fetch one provider's live model list off-thread and repopulate the cache.
+
+    Fire-and-forget helper for the stale-while-revalidate path in
+    :func:`cached_provider_model_ids`: the stale entry has already been
+    served, so this thread only exists to make the *next* open fresh.
+    Fully exception-isolated; removes the slug from the in-flight guard on
+    exit so a later open can schedule a new attempt.
+    """
+    try:
+        live = provider_model_ids(provider, force_refresh=False)
+        cache = _load_provider_models_cache()
+        now = time.time()
+        if live:
+            cache[provider] = {"fp": fingerprint, "at": now, "models": list(live)}
+        else:
+            # Negative-cache the failure so the next picker open doesn't
+            # queue another doomed network attempt. Keep any previous
+            # model list as the stale fallback — stale data beats no data.
+            previous = cache.get(provider) if isinstance(cache.get(provider), dict) else {}
+            kept_models = previous.get("models") if (
+                previous.get("fp") == fingerprint and isinstance(previous.get("models"), list)
+            ) else []
+            cache[provider] = {
+                "fp": fingerprint,
+                "at": now,
+                "models": list(kept_models or []),
+                "negative": True,
+            }
+        _save_provider_models_cache(cache)
+    except Exception:
+        logger.debug("Background model-list refresh failed for %s", provider, exc_info=True)
+    finally:
+        _provider_models_refresh_inflight.discard(provider)
+
+
 def cached_provider_model_ids(
     provider: Optional[str],
     *,
@@ -3187,8 +3239,19 @@ def cached_provider_model_ids(
 ) -> list[str]:
     """Disk-cached wrapper around :func:`provider_model_ids`.
 
-    Hits the cache when fresh; otherwise calls the live function and
-    persists a non-empty result. Always returns a list (never None).
+    Hit behaviour:
+
+    - fresh entry → returned immediately
+    - stale entry → returned immediately, refreshed in a background thread
+      (stale-while-revalidate). This keeps the picker (desktop model tab,
+      ``/model``, aux pickers) from blocking 15-70s on a cold cache when
+      live ``/models`` endpoints are slow or unreachable — a stale catalog
+      beats a timed-out picker.
+    - failed live fetch → negative-cached for
+      ``_PROVIDER_MODELS_NEGATIVE_TTL`` so a dead network is retried at most
+      once per window instead of on every open
+    - ``force_refresh=True`` (explicit user "refresh models" action) keeps
+      its synchronous contract and bypasses all of the above
     """
     normalized = normalize_provider(provider) or (provider or "")
     if not normalized:
@@ -3199,17 +3262,48 @@ def cached_provider_model_ids(
     entry = cache.get(normalized)
     now = time.time()
 
-    if (
-        not force_refresh
-        and isinstance(entry, dict)
-        and entry.get("fp") == fp
-        and isinstance(entry.get("models"), list)
-        and entry["models"]
-        and (now - float(entry.get("at", 0))) < ttl_seconds
-    ):
-        return list(entry["models"])
+    if not force_refresh:
+        if (
+            isinstance(entry, dict)
+            and entry.get("fp") == fp
+            and isinstance(entry.get("models"), list)
+            and (entry["models"] or entry.get("negative"))
+        ):
+            age = now - float(entry.get("at", 0))
+            negative = bool(entry.get("negative"))
+            if negative:
+                if age < _PROVIDER_MODELS_NEGATIVE_TTL:
+                    return list(entry["models"])
+            elif entry["models"] and age < ttl_seconds:
+                return list(entry["models"])
 
-    # Cache miss / stale / forced refresh — call the live path.
+        # Fresh-miss or stale → serve stale when possible. A stale entry
+        # with the SAME fingerprint is always preferable to blocking the
+        # caller on the network: return it and schedule an off-thread
+        # refresh so the next open is warm.
+        has_same_fp_models = (
+            isinstance(entry, dict)
+            and entry.get("fp") == fp
+            and isinstance(entry.get("models"), list)
+            and entry["models"]
+        )
+        if has_same_fp_models and normalized not in _provider_models_refresh_inflight:
+            _provider_models_refresh_inflight.add(normalized)
+            try:
+                t = threading.Thread(
+                    target=_refresh_provider_models_in_background,
+                    args=(normalized, fp),
+                    daemon=True,
+                    name=f"provider-models-refresh-{normalized}",
+                )
+                t.start()
+            except Exception:
+                # Thread spawn failed — drop the guard so a later call retries.
+                _provider_models_refresh_inflight.discard(normalized)
+        if has_same_fp_models:
+            return list(entry["models"])
+
+    # Cache miss (nothing to serve) / forced refresh — call the live path.
     live = provider_model_ids(normalized, force_refresh=force_refresh)
     if live:
         cache[normalized] = {
@@ -3230,6 +3324,18 @@ def cached_provider_model_ids(
         and entry["models"]
     ):
         return list(entry["models"])
+
+    # Nothing at all: negative-cache the empty result so repeated opens
+    # don't each pay the full network timeout. Only reached on a true cold
+    # miss with a failed fetch.
+    if not force_refresh:
+        cache[normalized] = {
+            "fp": fp,
+            "at": now,
+            "models": [],
+            "negative": True,
+        }
+        _save_provider_models_cache(cache)
     return list(live or [])
 
 
