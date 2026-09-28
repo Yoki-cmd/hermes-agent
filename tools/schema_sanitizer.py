@@ -145,14 +145,14 @@ def _sanitize_single_tool(tool: dict) -> dict:
     params = fn.get("parameters")
     # Missing / non-dict parameters → substitute the minimal valid shape.
     if not isinstance(params, dict):
-        fn["parameters"] = {"type": "object", "properties": {}}
+        fn["parameters"] = {"type": "object", "properties": {}, "required": []}
         return out
 
     fn["parameters"] = _sanitize_node(params, path=fn.get("name", "<tool>"))
     # After recursion, guarantee the top-level is an object with properties.
     top = fn["parameters"]
     if not isinstance(top, dict):
-        fn["parameters"] = {"type": "object", "properties": {}}
+        fn["parameters"] = {"type": "object", "properties": {}, "required": []}
     else:
         if top.get("type") != "object":
             top["type"] = "object"
@@ -171,6 +171,17 @@ def _sanitize_single_tool(tool: dict) -> dict:
         fn["parameters"], path=fn.get("name", "<tool>")
     )
     fn["parameters"] = _strip_ref_siblings(fn["parameters"])
+    # Gateway/proxy compat: some deployments (observed on AgentRouter's
+    # ps.air-outer.com nodes serving DeepSeek upstreams over streaming) turn a
+    # MISSING ``required`` key into ``null`` when re-serializing tool schemas,
+    # and the upstream then rejects the entire request with:
+    #     Invalid schema for function 'X': null is not of type "array"
+    # Absence is the trigger; an explicit (possibly empty) array is valid
+    # JSON Schema and accepted by every backend we target. Applied last so no
+    # earlier pass can drop it.
+    _top = fn.get("parameters")
+    if isinstance(_top, dict) and _top.get("type") == "object":
+        _top.setdefault("required", [])
     return out
 
 

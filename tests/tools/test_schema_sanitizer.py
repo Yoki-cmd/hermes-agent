@@ -23,7 +23,7 @@ def _tool(name: str, parameters: dict) -> dict:
 def test_object_without_properties_gets_empty_properties():
     tools = [_tool("t", {"type": "object"})]
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}, "required": []}
 
 
 def test_nested_object_without_properties_gets_empty_properties():
@@ -137,13 +137,13 @@ def test_anyof_nested_objects_sanitized():
 def test_missing_parameters_gets_default_object_schema():
     tools = [{"type": "function", "function": {"name": "t"}}]
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}, "required": []}
 
 
 def test_non_dict_parameters_gets_default_object_schema():
     tools = [_tool("t", "object")]  # pathological
     out = sanitize_tool_schemas(tools)
-    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}, "required": []}
 
 
 def test_required_pruned_to_existing_properties():
@@ -154,6 +154,26 @@ def test_required_pruned_to_existing_properties():
     })]
     out = sanitize_tool_schemas(tools)
     assert out[0]["function"]["parameters"]["required"] == ["name"]
+
+
+def test_missing_required_gets_empty_array():
+    """AgentRouter gateway compat: some gateway nodes re-serialize a missing
+    top-level ``required`` key as ``null`` and the upstream rejects the whole
+    request ("null is not of type \"array\""). Every top-level parameters
+    schema must carry an explicit array."""
+    tools = [_tool("t", {"type": "object", "properties": {}})]
+    out = sanitize_tool_schemas(tools)
+    assert out[0]["function"]["parameters"]["required"] == []
+
+
+def test_empty_required_kept_as_empty_array():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": [],
+    })]
+    out = sanitize_tool_schemas(tools)
+    assert out[0]["function"]["parameters"]["required"] == []
 
 
 def test_well_formed_schema_unchanged():
