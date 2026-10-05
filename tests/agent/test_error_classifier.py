@@ -274,6 +274,68 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    # ── Account-pool 5xx must not enter the compression path ──
+    # Local account-pool endpoints reject with a body like "no usable
+    # account ... parked by the daily token limit".  The "token limit"
+    # wording used to match _CONTEXT_OVERFLOW_PATTERNS and routed a healthy
+    # tiny session into compression, ending in "Context length exceeded
+    # (16 tokens). Cannot compress further."  These are transient
+    # server-side capacity issues — retry with backoff, never compress.
+
+    def test_503_account_pool_exhausted_is_overloaded_not_overflow(self):
+        msg = (
+            "no usable account for realm 'intl': all are disabled, cooling "
+            "down, expired or parked by the daily token limit - add or "
+            "enable one at the dashboard (/)"
+        )
+        e = MockAPIError(
+            f"Error code: 503 - {msg}",
+            status_code=503,
+            body={"error": {"message": msg, "type": "server_error", "code": 503}},
+        )
+        result = classify_api_error(e, provider="custom", model="deepseek-v4.1-flash")
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+
+    def test_500_account_pool_exhausted_is_overloaded_not_overflow(self):
+        e = MockAPIError(
+            "no usable account - add or enable one at the dashboard",
+            status_code=500,
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_compress is False
+
+    def test_400_account_pool_exhausted_is_overloaded_not_overflow(self):
+        e = MockAPIError(
+            "no usable account - add or enable one at the dashboard",
+            status_code=400,
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_compress is False
+
+    def test_message_only_account_pool_exhausted_is_overloaded(self):
+        e = MockAPIError(
+            "no usable account for realm 'intl' - add or enable one at the dashboard"
+        )
+        result = classify_api_error(e, provider="custom")
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_compress is False
+
+    def test_503_real_context_overflow_still_compresses(self):
+        """Boundary guard: a genuine 5xx context-overflow body (llama.cpp
+        style) must still route into the compression path."""
+        e = MockAPIError(
+            "slot context: N tokens, prompt 5000 tokens - exceeds the max_model_len",
+            status_code=503,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.context_overflow
+        assert result.retryable is True
+        assert result.should_compress is True
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server

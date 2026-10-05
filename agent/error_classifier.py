@@ -487,6 +487,21 @@ _EMPTY_PROVIDER_RESPONSE_PATTERNS = [
     "empty response stream",
 ]
 
+# Account-pool / multi-account router exhaustion.  A local endpoint fronting
+# several upstream accounts rejects requests with a 5xx body when none is
+# usable ("no usable account for realm 'x': all are disabled, cooling down,
+# expired or parked by the daily token limit").  The "daily token limit"
+# wording falsely matches the bare "token limit" entry in
+# _CONTEXT_OVERFLOW_PATTERNS — without this guard the request is routed into
+# the compression path and a healthy tiny session ends in the misleading
+# "Context length exceeded (N tokens). Cannot compress further."
+# These are transient server-side capacity issues: retry with backoff —
+# never compress, never rotate credentials.
+_ACCOUNT_POOL_UNAVAILABLE_PATTERNS = [
+    "no usable account",
+    "add or enable one at the dashboard",
+]
+
 # the unknown bucket and get misreported as empty responses.
 _TIMEOUT_MESSAGE_PATTERNS = [
     "timed out",
@@ -1159,6 +1174,10 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=False,
             )
+        # Account-pool exhaustion (see _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+        # the "daily token limit" wording must not enter the compression path.
+        if any(p in error_msg for p in _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+            return result_fn(FailoverReason.overloaded, retryable=True)
         if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
             return result_fn(
                 FailoverReason.context_overflow,
@@ -1178,6 +1197,10 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=False,
             )
+        # Account-pool exhaustion (see _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+        # the "daily token limit" wording must not enter the compression path.
+        if any(p in error_msg for p in _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+            return result_fn(FailoverReason.overloaded, retryable=True)
         if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
             return result_fn(
                 FailoverReason.context_overflow,
@@ -1363,6 +1386,11 @@ def _classify_400(
             retryable=True,
             should_compress=False,
         )
+
+    # Account-pool exhaustion (see _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+    # the "daily token limit" wording must not enter the compression path.
+    if any(p in error_msg for p in _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+        return result_fn(FailoverReason.overloaded, retryable=True)
 
     # Context overflow from 400
     if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
@@ -1587,6 +1615,11 @@ def _classify_by_message(
             retryable=True,
             should_compress=False,
         )
+
+    # Account-pool exhaustion (see _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+    # the "daily token limit" wording must not enter the compression path.
+    if any(p in error_msg for p in _ACCOUNT_POOL_UNAVAILABLE_PATTERNS):
+        return result_fn(FailoverReason.overloaded, retryable=True)
 
     # Context overflow patterns
     if any(p in error_msg for p in _CONTEXT_OVERFLOW_PATTERNS):
